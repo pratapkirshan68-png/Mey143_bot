@@ -147,7 +147,8 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=run_web).start()
     print("Bot is starting...")
-    app.run()        except Exception as e:
+    app.run()  
+except Exception as e:
             await message.reply_text(f"✅ Deleted from DB, but failed to delete from Channel: {e}")
     else:
         await message.reply_text("❌ Movie not found.")
