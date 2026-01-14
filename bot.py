@@ -1,85 +1,153 @@
-import requests
+import os
+import sqlite3
+import threading
+from flask import Flask
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from config import *
-from database import init_db, add_movie, search_movie_db, delete_movie, get_total_count
+from tmdbv3api import TMDb, Movie
+from dotenv import load_dotenv
 
-bot = Client("MovieBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-init_db()
+load_dotenv()
 
-# --- TMDB HELPER ---
-def get_tmdb_info(query):
-    url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={query}"
-    res = requests.get(url).json()
-    if res.get("results"):
-        movie = res["results"][0]
-        return {
-            "title": movie["original_title"],
-            "poster": f"https://image.tmdb.org/t/p/w500{movie['poster_path']}" if movie['poster_path'] else None,
-            "year": movie["release_date"][:4] if movie.get("release_date") else "N/A",
-            "rating": movie["vote_average"]
-        }
-    return None
+# --- CONFIG ---
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SEARCH_CHAT = int(os.getenv("SEARCH_CHAT"))
+FILES_CHANNEL = int(os.getenv("FILES_CHANNEL"))
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS").split(",")]
+WATERMARK_TEXT = os.getenv("WATERMARK_TEXT", "PratapCinema")
 
-# --- AUTO-INDEXING (When Admin posts in FILES_CHANNEL) ---
-@bot.on_message(filters.chat(FILES_CHANNEL) & (filters.video | filters.document))
-async def index_handler(client, message):
-    title = message.caption or (message.video.file_name if message.video else message.document.file_name)
-    if title:
-        add_movie(title, message.id, FILES_CHANNEL)
+# TMDB Setup
+tmdb = TMDb()
+tmdb.api_key = TMDB_API_KEY
+movie_search = Movie()
 
-# --- USER SEARCH (Listens ONLY in SEARCH_CHAT) ---
-@bot.on_message(filters.chat(SEARCH_CHAT) & filters.text & ~filters.command(["pratap", "pratap2"]))
-async def search_handler(client, message):
-    query = message.text
-    db_movie = search_movie_db(query)
-    
-    if not db_movie:
-        return # Skip if movie not in our channel
+# Bot Setup
+app = Client("movie_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-    # Fetch info from TMDB
-    tmdb = get_tmdb_info(query)
-    caption = f"🎬 **{db_movie[0].upper()}**\n\n"
-    if tmdb:
-        caption += f"🌟 Rating: {tmdb['rating']}\n📅 Year: {tmdb['year']}\n\n"
-    
-    caption += "✅ **Re-uploaded by Pratap Cinema**\n"
-    caption += "🚫 Do not copy without permission.\n"
-    caption += f"{INVISIBLE_WATERMARK}" # Anti-Theft Layer
+# Database Setup
+def init_db():
+    conn = sqlite3.connect("movies.db")
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS movies 
+                      (title TEXT, message_id INTEGER, file_id TEXT)''')
+    conn.commit()
+    conn.close()
 
-    # Send Info Poster
-    if tmdb and tmdb['poster']:
-        await message.reply_photo(tmdb['poster'], caption=caption)
+def add_movie(title, msg_id, file_id):
+    conn = sqlite3.connect("movies.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO movies VALUES (?, ?, ?)", (title.lower(), msg_id, file_id))
+    conn.commit()
+    conn.close()
 
-    # RE-SEND FILE (Anti-Theft: No Forward Tag)
-    await client.copy_message(
-        chat_id=message.chat.id,
-        from_chat_id=FILES_CHANNEL,
-        message_id=db_movie[1],
-        caption=caption,
-        reply_to_message_id=message.id
-    )
+def get_movie(title):
+    conn = sqlite3.connect("movies.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT message_id FROM movies WHERE title LIKE ?", ('%' + title.lower() + '%',))
+    res = cursor.fetchone()
+    conn.close()
+    return res[0] if res else None
 
-# --- ADMIN COMMAND 1: /pratap ---
-@bot.on_message(filters.command("pratap") & filters.user(ADMIN_IDS))
-async def count_handler(client, message):
-    count = get_total_count()
-    await message.reply_text(f"🎬 **Total Movies in DB:** {count}")
+# --- INVISIBLE WATERMARK LOGIC ---
+def get_invisible_watermark():
+    # Uses Zero-Width Joiner/Non-Joiner to hide text
+    mapping = {'0': '\u200B', '1': '\u200C', '2': '\u200D', '3': '\u2060'} 
+    # Simply wrapping in hidden characters for this demo
+    return f"\u200B\u200C{WATERMARK_TEXT}\u200D"
 
-# --- ADMIN COMMAND 2: /pratap2 ---
-@bot.on_message(filters.command("pratap2") & filters.user(ADMIN_IDS))
-async def delete_handler(client, message):
+# --- ADMIN COMMANDS ---
+
+@app.on_message(filters.command("pratap") & filters.user(ADMIN_IDS))
+async def count_movies(client, message):
+    conn = sqlite3.connect("movies.db")
+    count = conn.execute("SELECT COUNT(*) FROM movies").fetchone()[0]
+    conn.close()
+    await message.reply(f"📊 Total movies in DB: {count}")
+
+@app.on_message(filters.command("pratap2") & filters.user(ADMIN_IDS))
+async def delete_movie(client, message):
     if len(message.command) < 2:
-        return await message.reply_text("Usage: `/pratap2 movie name`")
+        return await message.reply("Usage: /pratap2 movie name")
     
-    movie_name = " ".join(message.command[1:])
-    msg_id = delete_movie(movie_name)
+    query = " ".join(message.command[1:])
+    conn = sqlite3.connect("movies.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT message_id FROM movies WHERE title LIKE ?", ('%' + query.lower() + '%',))
+    row = cursor.fetchone()
     
-    if msg_id:
+    if row:
+        msg_id = row[0]
         try:
             await client.delete_messages(FILES_CHANNEL, msg_id)
-            await message.reply_text(f"✅ Deleted **{movie_name}** from DB and Channel.")
+            cursor.execute("DELETE FROM movies WHERE message_id = ?", (msg_id,))
+            conn.commit()
+            await message.reply("✅ Deleted from Channel and Database.")
         except Exception as e:
+            await message.reply(f"❌ Error deleting: {e}")
+    else:
+        await message.reply("❌ Movie not found in DB.")
+    conn.close()
+
+# --- FILE INDEXER ---
+# When Admin sends a file to FILES_CHANNEL, it saves to DB
+@app.on_message(filters.chat(FILES_CHANNEL) & (filters.video | filters.document))
+async def index_file(client, message):
+    title = message.caption or "Unknown"
+    # Logic: If caption has a name, we use it as title
+    add_movie(title, message.id, message.video.file_id if message.video else message.document.file_id)
+
+# --- SEARCH LOGIC ---
+@app.on_message(filters.chat(SEARCH_CHAT) & filters.text & ~filters.command(["pratap", "pratap2"]))
+async def search_movie(client, message):
+    query = message.text
+    # 1. Search DB
+    msg_id = get_movie(query)
+    
+    if not msg_id:
+        return # Optionally reply "Not Found"
+
+    # 2. Search TMDB for Poster/Details
+    tmdb_results = movie_search.search(query)
+    caption = f"🎬 **Title:** {query.upper()}\n\n"
+    poster_url = None
+    
+    if tmdb_results:
+        movie = tmdb_results[0]
+        poster_url = f"https://image.tmdb.org/t/p/w500{movie.poster_path}"
+        caption += f"📝 **About:** {movie.overview[:200]}...\n"
+        caption += f"⭐ **Rating:** {movie.vote_average}\n"
+
+    caption += f"\n📢 **Join: @PratapCinema**"
+    caption += get_invisible_watermark() # Hidden Watermark
+
+    # 3. RE-SEND FILE (No Forwarding)
+    # copy_message creates a NEW message, removing "Forwarded From"
+    await client.copy_message(
+        chat_id=SEARCH_CHAT,
+        from_chat_id=FILES_CHANNEL,
+        message_id=msg_id,
+        caption=caption,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Support Group", url="https://t.me/your_group")]
+        ])
+    )
+
+# --- UPTIME ROBOT SERVER ---
+web_app = Flask(__name__)
+@web_app.route('/')
+def home(): return "Bot is Alive"
+
+def run_web():
+    web_app.run(host="0.0.0.0", port=8080)
+
+if __name__ == "__main__":
+    init_db()
+    threading.Thread(target=run_web).start()
+    print("Bot is starting...")
+    app.run()        except Exception as e:
             await message.reply_text(f"✅ Deleted from DB, but failed to delete from Channel: {e}")
     else:
         await message.reply_text("❌ Movie not found.")
