@@ -1,5 +1,4 @@
-flask
 pyrogram
 tgcrypto
-tmdbv3api
-python-dotenv
+aiohttp
+requests
