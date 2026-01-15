@@ -1,4 +1,4 @@
-pyrogram
+ppyrogram
 tgcrypto
-aiohttp
 requests
+flask
