@@ -7,7 +7,7 @@ from flask import Flask
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION (Apni details yahan bharein) ---
 API_ID = int(os.environ.get("API_ID", "12345"))
 API_HASH = os.environ.get("API_HASH", "your_hash")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_token")
@@ -16,22 +16,26 @@ TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "your_tmdb_key")
 STORAGE_CHANNEL = -1003536285620
 SEARCH_CHAT = -1003556253573
 FILES_CHANNEL = -1003682112470
-ADMIN_ID = 12345678 
+ADMIN_ID = 12345678 # Apna numerical ID yahan daalein
 
-# --- DATABASE ---
+# --- DATABASE SETUP ---
 db_conn = sqlite3.connect("master_movies.db", check_same_thread=False)
 cursor = db_conn.cursor()
-cursor.execute('''CREATE TABLE IF NOT EXISTS movies (id INTEGER PRIMARY KEY, name TEXT, file_id TEXT, storage_msg_id INTEGER)''')
+cursor.execute('''CREATE TABLE IF NOT EXISTS movies 
+                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                   name TEXT, 
+                   file_id TEXT, 
+                   storage_msg_id INTEGER)''')
 db_conn.commit()
 
 app = Client("MasterMovieBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- TMDB FEEL HELPER ---
+# --- TMDB HELPER ---
 def get_movie_details(query):
     try:
         url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={query}"
         res = requests.get(url).json()
-        if res['results']:
+        if res.get('results'):
             movie = res['results'][0]
             return {
                 "title": movie.get('title', 'Unknown'),
@@ -39,43 +43,97 @@ def get_movie_details(query):
                 "poster": f"https://image.tmdb.org/t/p/w500{movie['poster_path']}" if movie.get('poster_path') else None,
                 "desc": movie.get('overview', 'No description available.')[:150] + "..."
             }
-    except: return None
+    except Exception:
+        return None
 
-# --- SEARCH ENGINE (UPGRADED FEEL) ---
-@app.on_message(filters.chat(SEARCH_CHAT) & filters.text & ~filters.command(["pratap", "pratap2"]))
+# --- AUTO INDEXER (Jab aap Storage Channel me file dalenge) ---
+@app.on_message(filters.chat(STORAGE_CHANNEL) & (filters.video | filters.document))
+async def auto_index(client, message):
+    movie_name = (message.caption or "Unknown Movie").lower().strip()
+    file_id = (message.video.file_id if message.video else message.document.file_id)
+    
+    cursor.execute("INSERT INTO movies (name, file_id, storage_msg_id) VALUES (?, ?, ?)", 
+                   (movie_name, file_id, message.id))
+    db_conn.commit()
+    print(f"✅ Indexed: {movie_name}")
+
+# --- SEARCH ENGINE ---
+@app.on_message(filters.chat(SEARCH_CHAT) & filters.text & ~filters.command(["pratap", "pratap2", "start"]))
 async def search_engine(client, message):
     query = message.text.lower().strip()
     
-    # Database Search
+    # Database Search (Case insensitive search)
     cursor.execute("SELECT name, storage_msg_id FROM movies WHERE name LIKE ?", (f'%{query}%',))
     results = cursor.fetchall()
 
     if not results:
-        # Professional Not Found Message
         no_found_text = (
-            "<b>❌ Movie Not Found in Database!</b>\n\n"
-            "<b>Tips for better search:</b>\n"
-            "• Spelling check karein (e.g. <i>Pushpa</i>)\n"
-            "• Sirf Movie ka naam likhein, faltu text nahi.\n"
-            "• Release year try karein (e.g. <i>Pushpa 2024</i>)\n\n"
-            "📢 <i>Request admin for upload!</i>"
+            "<b>❌ Movie Not Found!</b>\n\n"
+            "• Spelling check karein.\n"
+            "• Sirf Movie ka naam likhein.\n"
         )
         temp = await message.reply_text(no_found_text)
-        await asyncio.sleep(30)
+        await asyncio.sleep(20)
         return await temp.delete()
 
-    # Agar movie mil gayi toh TMDB se details nikaalna
+    # Movie details from TMDB
     movie_info = get_movie_details(query)
     
-    for name, msg_id in results[:1]: # Sirf top result ke liye
-        caption = (
-            f"🎬 <b>TITLE: {name.upper()}</b>\n\n"
-            f"⭐ <b>Rating:</b> {movie_info['rating'] if movie_info else '7.5'}/10\n"
-            f"📝 <b>About:</b> {movie_info['desc'] if movie_info else 'Exclusive Content'}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👑 <b>Uploaded By:</b> @CinemaPratap_Admin\n"
-            f"📢 <b>Channel:</b> @CinemaPratap\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━"
+    # Sirf pehla result dikhane ke liye
+    name, msg_id = results[0]
+    
+    # Telegram link generation (Remove -100 from channel ID)
+    chat_link_id = str(FILES_CHANNEL).replace("-100", "")
+    download_url = f"https://t.me/c/{chat_link_id}/{msg_id}"
+
+    caption = (
+        f"🎬 <b>TITLE: {name.upper()}</b>\n\n"
+        f"⭐ <b>Rating:</b> {movie_info['rating'] if movie_info else '7.0'}/10\n"
+        f"📝 <b>About:</b> {movie_info['desc'] if movie_info else 'Exclusive Content available in channel.'}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📢 <b>Join:</b> @CinemaPratap\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    buttons = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📥 Get Download Link", url=download_url)
+    ]])
+
+    try:
+        if movie_info and movie_info['poster']:
+            await message.reply_photo(photo=movie_info['poster'], caption=caption, reply_markup=buttons)
+        else:
+            await message.reply_text(caption, reply_markup=buttons)
+    except Exception as e:
+        await message.reply_text(f"✅ <b>{name.upper()}</b> mil gayi hai!\nNiche diye link par click karein.", reply_markup=buttons)
+
+# --- ADMIN COMMANDS ---
+@app.on_message(filters.command("pratap") & filters.user(ADMIN_ID))
+async def stats(client, message):
+    cursor.execute("SELECT COUNT(*) FROM movies")
+    count = cursor.fetchone()[0]
+    await message.reply_text(f"📊 **Total Movies in DB:** {count}")
+
+@app.on_message(filters.command("pratap2") & filters.user(ADMIN_ID))
+async def delete_movie(client, message):
+    if len(message.command) < 2: return
+    query = " ".join(message.command[1:])
+    cursor.execute("DELETE FROM movies WHERE name LIKE ?", (f'%{query}%',))
+    db_conn.commit()
+    await message.reply_text(f"🗑 Deleted movies matching: {query}")
+
+# Flask for Uptime
+web_app = Flask(__name__)
+@web_app.route('/')
+def home(): return "Bot Active"
+
+def run_web():
+    web_app.run(host="0.0.0.0", port=8080)
+
+if __name__ == "__main__":
+    threading.Thread(target=run_web, daemon=True).start()
+    print("🚀 Bot is starting...")
+    app.run()            f"━━━━━━━━━━━━━━━━━━━━━━"
         )
 
         buttons = InlineKeyboardMarkup([[
